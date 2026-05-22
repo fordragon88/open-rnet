@@ -76,6 +76,16 @@ xor_table = [Unknown - different from JSM tables]
 keys      = [0x47, 0xA1, 0x62, 0xAD, 0x2E, 0x05, 0xB3, 0xEC]
 ```
 
+**Known XOR Table D (JSM, serial b68021ae):**
+```
+xor_table = [0x6C, 0xB0, 0xC0, 0xFB, 0x36, 0x20, 0x79, 0x45]
+serial    = [0xB6, 0x80, 0x21, 0xAE, 0x00, 0x00, 0x00, 0x00]
+keys      = [0xDA, 0x30, 0xE1, 0x55, 0x36, 0x20, 0x79, 0x45]
+```
+Note: padding bytes (seq 4-7) are identical to Table A — these positions appear to be a constant suffix shared across networks. (Source: 2026-05-21 capture, file `full-dump-2026-05-21-1H00M.log`)
+
+**Multi-stage challenge:** Captures show the PM running the 8-frame challenge/response twice in a row — first against slot 1 (JSM), then against slot 2 (e.g., ICS seating controller) using the same XOR table but with the slot nibble of the ID changed (`1F02xxxx#` instead of `1F01xxxx#`). All authenticated modules on the network are challenged in one boot sweep. (Source: 2026-05-21 capture)
+
 **Example challenge/response (serial 08901c8a):**
 ```
 RTR: 0x1f00 08 2f  →  Response: 0x1f01 08 08  (seq0, key=08, serial[0]=08)
@@ -150,6 +160,9 @@ Byte 0: Command type
   0x4F = ICS read response
   0x0F = ICS write response
   0x8F = ICS operation complete
+  0x2F = ICS read returned data (variant of 0x4F seen in 78F/79X exchanges)
+  0xCF = ICS error response
+  0x80 = ICS close register / end transfer (e.g., `78F#80...`)
 
 Byte 1: Register/Page
   0x80 = Page 0 (main config)
@@ -210,6 +223,21 @@ POP Segmented frames are used for multi-frame parameter transfers between device
 |----------|------|-------------|
 | `0x1E000000` | XTD | POP (Parameter Object Protocol) segmented response base ID. Node and transfer code encoded in ID bits: `0x1E000000 | (node << 15) | (tc << 18)`. Used for multi-frame parameter transfers from device to programmer. (Source: DongleInterface.dll `POP_SEG_RES_ID`) |
 | `0x1E400000` | XTD | POP (Parameter Object Protocol) segmented request base ID. Node and transfer code encoded in ID bits: `0x1E400000 | (node << 15) | (tc << 18)`. Used for multi-frame parameter transfers from programmer to device. (Source: DongleInterface.dll `POP_SEG_REQ_ID`) |
+| `0x1E80xxxx` | XTD | **Status / transfer-complete family**, parameterized by the low 16 bits. `1E80000F#` = "transfer complete OK". `1E80BEA7#` (and similar non-zero codes) seen at startup — likely a boot status code or CRC-of-serial. The full `1E80xxxx` space encodes (node, tc, status). (Source: 2026-05-21 capture) |
+| `0x1E84xxxx` – `0x1E87xxxx` | XTD | **PM boot banner**, four consecutive frames emitted by the PM ~50 ms after `00C#` and before the serial-number challenge. Captured values: `1E840000#`, `1E850000#`, `1E863D16#`, `1E870006#`. Suspected to encode firmware build (`0x3D16` = 15638) and hardware revision (`0x0006`); content varies per chair. The same four-frame banner is repeated ~0.5 s later, after `1E80BEA7#`. (Source: 2026-05-21 capture) |
+
+**POP-Segmented transfer-code / CRC byte:** the first byte of segment 1 (`1E42xxxx#` or `1E43xxxx#`) in each transfer is **not parameter data** — it is a per-transfer header byte (likely CRC of the transfer payload, or a sequence-of-transfers identifier). Observed values across 16 transfers in one programmer session: `F6, AB, E1, 69, F2, CB, A9, EC, 6F, CC, …` (all distinct). The two bytes that follow (e.g., `FF 01`) appear to be a length/flags prefix. Decoders should skip the first 1-3 bytes of segment 1 before treating the rest as payload. (Source: 2026-05-21 capture)
+
+**POP-Segmented payload-string format:** when a transfer carries display text (menu entries, profile names, output-mode labels), strings are stored as **20-byte fixed-width fields padded with `0x20`** (space, not null) and terminated by the marker sequence `3E 40 3C FF 3B 0F 3D FF`. Profile-name records use the marker `B2 F9 …` instead. After collecting all segment payloads in order and concatenating, `[A-Za-z0-9 ()]+` substrings of length 20 are the human-readable labels. Captured top-level menu strings: `Drive`, `Seating`, `Bluetooth Devices`, `IR`, `Output Mode (5)`, `Output Mode (6)`, `Output Mode (7)`, `Programming`, `Indoor`, `Normal`, `Profile 3`, `Profile 4`, `Profile 5`, `Profile 6`, `Profile 7`, `Attendant`. (Source: 2026-05-21 capture, transfer #3 of `1H00M.log`)
+
+**POP-Quick slot addressing via 78F:** when the R-Net Programmer addresses the bus on `0x78F`, the **second hex digit of the command byte selects the target slot**:
+- `78F#40xxxx…` → broadcast (all slots reply on their own `79N`)
+- `78F#41xxxx…` → slot 1 (e.g., JSM) — replies on `0x791`
+- `78F#42xxxx…` → slot 2 (e.g., ICS seating) — replies on `0x792`
+- `78F#43xxxx…` → slot 3 — replies on `0x793`
+- … etc.
+
+This explains how the programmer enumerates the network: it sends the same query with the slot nibble incremented, and each populated slot answers in turn. (Source: 2026-05-21 capture)
 
 ### Configuration Transfer Protocol (0x1E3X-0x1E8X)
 
@@ -254,9 +282,26 @@ Extended frames used for bulk configuration/firmware transfer:
 | `060#90010040` | STD | LiftProfile joystick event start |
 | `060#90010000` | STD | LiftProfile joystick event stop |
 | `061#404M0000` | STD | JSMtx suspend mode M (M = 0x40+mode: 0x40=mode0, 0x41=mode1, ..., 0x48=mode8) |
+| `061#40100000` | STD | **Suspend mode 0 (drive)** — special encoding. Captures consistently show `40 10`, not `40 00` as the `404M0000` pattern would suggest. The `0x10` byte appears to indicate a "global/master suspend" since mode 0 is the implicit default. Modes 1-7 use the documented `4001` … `4007` form. (Source: 2026-05-21 capture, file `full-dump-2026-05-21-1H51M.log`) |
 | `061#004M0000` | STD | JSMtx select mode M (last mode must be suspended first) |
 | `061#00400000` | STD | Select mode 0 (drive) |
 | `061#00480000` | STD | Select mode 8 (**OBP — On-Board Programming**). Mode 8 is reserved for OBP. Activated by Horn+On/Off button combo or via mode change frames. Requires "OBP Keycode Entry"=Yes (OEM param). See `docs/OBP_ENABLE_GUIDE.md` |
+
+**Default top-level mode/profile names** (read from a stock chair via POP-Segmented transfer #3):
+```
+Mode 0  — "Drive"
+Mode 1  — "Seating"
+Mode 2  — "Bluetooth Devices"   (entry in some firmwares; "IR" follows in same string)
+Mode 5  — "Output Mode (5)"
+Mode 6  — "Output Mode (6)"
+Mode 7  — "Output Mode (7)"
+Mode 8  — "Programming"          (OBP entry)
+
+Profiles within a drive mode:
+  "Indoor", "Normal", "Profile 3", "Profile 4",
+  "Profile 5", "Profile 6", "Profile 7", "Attendant"
+```
+Each label is a 20-character space-padded field. (Source: 2026-05-21 capture)
 ---
 
 ## 6. JOYSTICK POSITION (DRIVE CONTROL)
@@ -297,7 +342,8 @@ Extended frames used for bulk configuration/firmware transfer:
 | `06X#90010040` | STD | PMtx chair angle motor is running |
 | `0C000005#` | XTD | PMtx global motor has stopped (0 MPH) |
 | `0C000006#` | XTD | PMtx global motor is decelerating |
-| `14300X00#LlHh` | XTD | **PMtx drive motor current. Periodic: 200ms**. Little-endian 16-bit. 0x02e8 = ~6A |
+| `14300X00#LlHh` | XTD | **PMtx drive motor current. Periodic: 200ms** (measured 250ms / ~4 Hz across three captures — controller-specific or load-dependent). Little-endian 16-bit. 0x02e8 = ~6A |
+| `140C0X01#LlHh` | XTD | **PMtx drive motor secondary telemetry. Periodic: ~250ms (~4 Hz)**, paired one-for-one with `14300X00`. Almost certainly motor voltage or PWM duty cycle (current's complementary channel). All-zero payload `0000` when chair is stationary. (Source: 2026-05-21 capture, present in all three logs) |
 
 ---
 
@@ -307,6 +353,7 @@ Extended frames used for bulk configuration/firmware transfer:
 |-------|------|-------------|
 | `0C040X00#` | XTD | Horn start. X=origin device (100-F00 range) |
 | `0C040X01#` | XTD | Horn stop. Horn can get stuck; sounds until stop frame sent |
+| `0C040201#` | XTD | **Button-click confirmation from device 2**, NOT a horn-stop variant. Captured pattern during a horn press: `0C040100#  0C040201#  0C040100#  0C040201#  0C040100#  0C040101#` — the device-2 frames are interleaved click acks (likely from the lighting controller or a UI device), and only the final `0C040101#` actually stops the horn. (Source: 2026-05-21 capture) |
 
 **Example:**
 ```bash
@@ -380,7 +427,7 @@ cansend can0 181C0D00#2050205120522053  # Play 4 ascending notes
 |-------|------|-------------|
 | `00E#XXXXXXXX00000000` | STD | **JSM serial number heartbeat. Periodic: 50ms** |
 | `03C30F0F#8787878787878787` | XTD | **JSM device heartbeat. Periodic: 100ms** |
-| `0C140X00#Xx` | XTD | **PM heartbeat. Periodic: 1000ms**. Alternates between values (0xC0, 0x01) |
+| `0C140X00#Xx` | XTD | **PM heartbeat. Periodic: 1000ms**. Alternates between values (0xC0, 0xC1). Measured rate is 2 Hz on the wire — each "tick" emits both halves of the toggle pair ~75 ms apart, then the pair repeats every 1 s. (Source: 2026-05-21 capture, all three logs) |
 | `0C140400#82` | XTD | Lamp controller heartbeat(?). **Periodic: 1000ms** |
 
 ---
@@ -457,6 +504,37 @@ cansend can0 181C0D00#2050205120522053  # Play 4 ascending notes
 29. 02000100#0000                 ; Joystick frames begin (10ms)
 ```
 
+### Variant: Multi-Module Network with PM Boot Banner
+
+When a multi-module network (PM + JSM + ICS or similar) powers up, the PM emits a boot banner before the serial-number challenge. Captured sequence from `full-dump-2026-05-21-1H00M.log`:
+
+```
+0.000  00C#                         ; JSM probes the bus
+0.020  00E#B68021AE00000000         ; JSM serial heartbeat begins (50ms)
+0.020  7B3#                         ; JSM requests s/n exchange
+0.058  1E840000#                    \
+0.058  1E850000#                     | PM boot banner (4 frames)
+0.058  1E863D16#                     | suspected: firmware build 0x3D16,
+0.060  1E870006#                    /  hardware revision 0x0006
+...
+0.121  7B3#R                        ; PM accepts
+0.139  1F00DA2C#R … 1F704500#R     ; PM challenges slot 1 (JSM), 8 frames
+0.144  1F01DAB6#  … 1F714500#       ; JSM responds, 8 frames
+0.149  1F02DAE7#  … 1F724501#       ; PM challenges slot 2 (ICS) using same XOR table,
+                                    ;   slot nibble = 02; ICS responds inline
+0.260  1E80BEA7#                    ; PM emits boot status (BEA7 = chair-specific code)
+0.260  1E840000# … 1E870006#        ; banner echoed once more
+0.330  7B1#                         ; config mode 1
+0.380  7B0#                         ; config mode 0 (run)
+0.400  1C0C0000#64                  ; battery
+0.460  1C2C0100#…                   ; time of day
+0.490  1C240101#                    ; JSM UI active
+0.500  03C30F0F#…                   ; JSM 100ms heartbeat begins
+0.640  140C0001#0000                ; motor telemetry begins
+```
+
+The `1E80xxxx` value differs per chair and may encode boot status or a CRC of the serial. (Source: 2026-05-21 capture)
+
 ---
 
 ## 20. BLUETOOTH MODULE (BTM) FRAMES
@@ -525,11 +603,13 @@ PM responses with different keys indicate XOR table mismatch:
 | `0C180101#030201` | XTD | Unknown |
 | `0C180201#210001` | XTD | Unknown |
 | `0C180401#` | XTD | Unknown |
-| `140C0X01#` | XTD | Unknown (motor related?) |
+| ~~`140C0X01#`~~ | XTD | ~~Unknown (motor related?)~~ — **resolved**, see Section 8: paired drive-motor telemetry channel running at ~4 Hz alongside `14300X00`. |
 | `0C000301#` | XTD | Module 3 interaction |
 | `0C000302#` | XTD | Module 3 interaction |
 | `0C000303#` | XTD | Module 3 interaction |
 | `0C000304#` | XTD | Module 3 interaction |
+| `15000000#` | XTD | Seen only during mode/profile changes (not periodic). Likely a UI broadcast tied to display refresh. Investigate further. (Source: 2026-05-21 capture, logs 2 & 3) |
+| `1C240F01#` | XTD | "Programmer-as-virtual-device ready" — variant of `1C240X01#` (UI active) where slot nibble is `F` (programmer). Sent at programmer startup and again on disconnect. (Source: 2026-05-21 capture, log 2) |
 
 ---
 
@@ -649,6 +729,32 @@ See `docs/RNET_ERROR_CODES.md` for the complete error code reference with descri
 
 **Security Weaknesses:**
 - No encryption
+- Challenge values ignored
+- Timing-based spoofing possible
+- Error injection enables control takeover
+- **One-shot authentication:** the JSM authenticates only at boot via the 8-frame `1F0X..1F7X` exchange. After that, the PM trusts every subsequent `00E#` and `02000100#` frame for the lifetime of the session — there is no periodic re-auth.
+- **Plaintext serial broadcast:** the JSM serial number is broadcast in `00E#` at 20 Hz. Anyone passively listening for ≤1 s captures the chair's full serial in the clear.
+- **XOR table is recoverable from 4 captured pairs:** because the serial is on the wire and the keys are in the challenge frames, `xor_table[seq] = serial[seq] XOR key[seq]` is trivially computable from a single boot capture. (Source: 2026-05-21 capture)
+- **POP-Quick / Programmer protocol has no auth beyond boot:** any device that can produce valid `0x78F` frames can read or write configuration once the network is up.
+
+---
+
+## Capture Observations Changelog (2026-05-21)
+
+The following entries throughout this dictionary were added or updated based on three live `candump` traces (`full-dump-2026-05-21-H11M15.log`, `full-dump-2026-05-21-1H00M.log`, `full-dump-2026-05-21-1H51M.log`) recorded from a single physical chair (JSM serial `B68021AE`):
+
+- **§ 2** — added **XOR Table D** for serial `b68021ae`; documented the second-stage challenge against slot 2 (multi-module sweep)
+- **§ 4** — extended the POP-Quick command-byte enum (`0x2F`, `0xCF`, `0x80`); documented the **transfer-code/CRC byte**, **20-char space-padded string format with marker `3E 40 3C FF 3B 0F 3D FF`**, **`78F` slot addressing via second nibble of command byte**, and **`1E80xxxx` / `1E84..1E87` boot banner family**
+- **§ 5** — added the **`061#40100000`** mode-0 suspend special form, and the default **top-level mode/profile name table** (Drive, Seating, Bluetooth Devices, IR, Output Mode 5/6/7, Programming, Indoor, Normal, Profile 3-7, Attendant)
+- **§ 8** — promoted **`140C0X01#`** from "Unknown (motor related?)" to documented secondary motor telemetry channel running ~4 Hz alongside `14300X00`; refined `14300X00` rate note (measured 250 ms / 4 Hz, not 200 ms)
+- **§ 9** — clarified that **`0C040201#`** is a button-click confirmation from device 2, not a horn-stop variant
+- **§ 15** — clarified that the PM heartbeat alternates `0xC0`/`0xC1` (typo `0x01` corrected) and emits at 2 Hz on the wire (paired-tick cadence)
+- **§ 19** — added the **multi-module boot variant** showing the `1E84..1E87` banner, slot-2 challenge, and `1E80BEA7` boot status
+- **§ 22** — added **`15000000`** (mode/profile UI broadcast) and **`1C240F01`** (programmer-as-virtual-device ready)
+- **Protocol Summary** — added four security-weakness bullets covering one-shot auth, plaintext serial, XOR-table recoverability, and unauthenticated programmer protocol
+
+Frame timings were cross-verified against the dictionary's documented rates; all match within measurement noise except the two marked discrepancies above (`14300X00` 250 ms vs documented 200 ms; `0C140X00` 2 Hz pair cadence vs documented 1 Hz).
+
 - Challenge values ignored
 - Timing-based spoofing possible
 - Error injection enables control takeover
