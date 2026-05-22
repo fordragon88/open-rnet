@@ -21,7 +21,7 @@ Comprehensive reference of all known R-Net CAN frames, compiled from pcap analys
 | `000#R` | RTR | PM sleep all devices (power off) |
 | `000#` | STD | JSM sleeping acknowledgment |
 | `002#R` | RTR | PM sleep all devices (alternate) |
-| `002#` | STD | Seen during JSM init |
+| `002#` | STD | Low-rate periodic (~0.04 Hz / one frame every ~25 s), not init-only. Originally documented as "Seen during JSM init" but observed continuously throughout all three 2026-05-21 captures including mid-session. Function still unknown. (Source: 2026-05-21 capture) |
 | `004#` | STD | JSM sleep commencing |
 | `004#R` | RTR | Related to sleep/wake sequence |
 | `00C#` | STD | JSM test CAN connection (checks for ACK before wake). If sent while JSM is on, turns it off |
@@ -418,6 +418,7 @@ cansend can0 181C0D00#2050205120522053  # Play 4 ascending notes
 | Frame | Type | Description |
 |-------|------|-------------|
 | `1C2C0X00#RrSsTtUuVvWw` | XTD | Time of day, little-endian format |
+| `1C2C0100#RrSsTtUuVvWw` | XTD | Time of day, alternate variant. Same payload format as `1C2C0X00#`, but with the third nibble fixed at `01` and the fourth at `00` (instead of `0X00`). Captured at exactly 1 Hz alongside the standard form. Likely indicates a different broadcasting source/device. (Source: 2026-05-21 capture, all three logs) |
 
 ---
 
@@ -751,10 +752,8 @@ The following entries throughout this dictionary were added or updated based on 
 - **§ 15** — clarified that the PM heartbeat alternates `0xC0`/`0xC1` (typo `0x01` corrected) and emits at 2 Hz on the wire (paired-tick cadence)
 - **§ 19** — added the **multi-module boot variant** showing the `1E84..1E87` banner, slot-2 challenge, and `1E80BEA7` boot status
 - **§ 22** — added **`15000000`** (mode/profile UI broadcast) and **`1C240F01`** (programmer-as-virtual-device ready)
+- **§ 1** — clarified that **`002#`** is low-rate periodic (~0.04 Hz throughout), not init-only as previously documented
+- **§ 14** — added the **`1C2C0100#`** alternate time-of-day variant observed at 1 Hz across all three captures
 - **Protocol Summary** — added four security-weakness bullets covering one-shot auth, plaintext serial, XOR-table recoverability, and unauthenticated programmer protocol
 
 Frame timings were cross-verified against the dictionary's documented rates; all match within measurement noise except the two marked discrepancies above (`14300X00` 250 ms vs documented 200 ms; `0C140X00` 2 Hz pair cadence vs documented 1 Hz).
-
-- Challenge values ignored
-- Timing-based spoofing possible
-- Error injection enables control takeover
